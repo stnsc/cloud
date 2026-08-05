@@ -1,0 +1,19 @@
+name = "cloud-storage-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "cloud-storage-files"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cloud-storage"
+database_id = "3b79e4d6-fdb9-43b7-9d89-5d84348b776d"
+
+[env.development]
+vars = { }
+
+[build]
+command = "npm run build"
+cwd = "./"
