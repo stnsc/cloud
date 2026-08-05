@@ -4,6 +4,7 @@ import Header from './components/Header';
 import Sidebar from './components/Sidebar';
 import FileExplorer from './components/FileExplorer';
 import Auth from './components/Auth';
+import UploadProgress from './components/UploadProgress';
 import { useApi } from './hooks/useApi';
 
 interface FileData {
@@ -22,6 +23,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [storage, setStorage] = useState({ used: 0, limit: 0, percentage: 0 });
+  const [uploadProgress, setUploadProgress] = useState<{ fileName: string; progress: number } | null>(null);
   const api = useApi();
 
   useEffect(() => {
@@ -74,14 +76,19 @@ function App() {
   const handleUpload = async (file: File) => {
     try {
       setError(null);
-      const newFile = await api.uploadFile(file);
+      setUploadProgress({ fileName: file.name, progress: 0 });
+      const newFile = await api.uploadFile(file, (progress) => {
+        setUploadProgress({ fileName: file.name, progress });
+      });
       setFiles([newFile, ...files]);
       // Refresh storage info after upload
       const storageInfo = await api.getStorage();
       setStorage(storageInfo);
+      setUploadProgress(null);
     } catch (err: any) {
       setError(err.message || 'Failed to upload file');
       console.error(err);
+      setUploadProgress(null);
     }
   };
 
@@ -119,6 +126,9 @@ function App() {
       <div className="app-main">
         <Sidebar isOpen={sidebarOpen} onUpload={handleUpload} storage={storage} />
         <main className="main-content">
+          {uploadProgress && (
+            <UploadProgress fileName={uploadProgress.fileName} progress={uploadProgress.progress} />
+          )}
           {error && (
             <div style={{
               padding: '1rem',

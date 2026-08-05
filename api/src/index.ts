@@ -195,6 +195,12 @@ export default {
 
       if (path === '/api/files' && method === 'GET') {
         return await handleListFiles(env, user.userId, corsHeaders);
+      } else if (path === '/api/files/get-upload-url' && method === 'POST') {
+        return await handleGetUploadUrl(request, env, user.userId, corsHeaders);
+      } else if (path === '/api/files/upload-chunk' && method === 'POST') {
+        return await handleUploadChunk(request, env, user.userId, corsHeaders);
+      } else if (path.match(/^\/api\/files\/complete-upload$/) && method === 'POST') {
+        return await handleCompleteUpload(request, env, user.userId, corsHeaders);
       } else if (path === '/api/files/upload' && method === 'POST') {
         return await handleUploadFile(request, env, user.userId, corsHeaders);
       } else if (path.match(/^\/api\/files\/[^/]+$/) && method === 'DELETE') {
@@ -241,6 +247,186 @@ async function handleListFiles(env: Env, userId: string, corsHeaders: any): Prom
   return new Response(JSON.stringify(files), {
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   });
+}
+
+async function handleGetUploadUrl(
+  request: Request,
+  env: Env,
+  userId: string,
+  corsHeaders: any
+): Promise<Response> {
+  try {
+    const body = await request.json() as any;
+    const { fileName, fileSize, mimeType } = body;
+
+    if (!fileName || !fileSize) {
+      return new Response(JSON.stringify({ error: 'fileName and fileSize required' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Check storage limit BEFORE generating URL
+    const currentUsage = await getUserStorageUsage(env, userId);
+    if (currentUsage + fileSize > STORAGE_LIMIT) {
+      return new Response(JSON.stringify({ 
+        error: 'Storage limit exceeded', 
+        limit: STORAGE_LIMIT,
+        used: currentUsage,
+        fileSize: fileSize
+      }), {
+        status: 413,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Generate a unique file ID and key
+    const fileId = uuidv4();
+
+    // Return fileId so frontend knows where to upload chunks
+    return new Response(JSON.stringify({
+      fileId,
+      fileName,
+      fileSize,
+      uploadEndpoint: '/api/files/upload-chunk'
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Get upload URL error:', error);
+    return new Response(JSON.stringify({ error: 'Failed to prepare upload' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+async function handleUploadChunk(
+  request: Request,
+  env: Env,
+  userId: string,
+  corsHeaders: any
+): Promise<Response> {
+  try {
+    const formData = await request.formData();
+    const fileId = formData.get('fileId') as string;
+    const chunkIndex = parseInt(formData.get('chunkIndex') as string);
+    const totalChunks = parseInt(formData.get('totalChunks') as string);
+    const fileName = formData.get('fileName') as string;
+    const mimeType = formData.get('mimeType') as string;
+    const chunkData = formData.get('chunk') as unknown as Blob;
+
+    if (!fileId || isNaN(chunkIndex) || isNaN(totalChunks) || !chunkData) {
+      return new Response(JSON.stringify({ error: 'Missing required fields' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const chunkKey = `${userId}/${fileId}/chunks/${chunkIndex}`;
+    const buffer = await chunkData.arrayBuffer();
+
+    // Upload chunk to R2
+    await env.R2_BUCKET.put(chunkKey, buffer);
+
+    return new Response(JSON.stringify({
+      fileId,
+      chunkIndex,
+      status: 'uploaded'
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Upload chunk error:', error);
+    return new Response(JSON.stringify({ error: 'Failed to upload chunk' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+async function handleCompleteUpload(
+  request: Request,
+  env: Env,
+  userId: string,
+  corsHeaders: any
+): Promise<Response> {
+  try {
+    const body = await request.json() as any;
+    const { fileId, fileName, totalChunks, mimeType, fileSize } = body;
+
+    if (!fileId || !fileName || !totalChunks) {
+      return new Response(JSON.stringify({ error: 'Missing required fields' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Use R2 multipart upload to avoid loading all chunks into memory
+    const r2Key = `${userId}/${fileId}/${fileName}`;
+    
+    // Start multipart upload
+    const multipartUpload = await env.R2_BUCKET.createMultipartUpload(r2Key, {
+      httpMetadata: {
+        contentType: mimeType || 'application/octet-stream',
+      },
+    });
+
+    const partETags: { partNumber: number; etag: string }[] = [];
+
+    // Upload each chunk as a part
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkKey = `${userId}/${fileId}/chunks/${i}`;
+      const chunkObj = await env.R2_BUCKET.get(chunkKey);
+      
+      if (!chunkObj) {
+        await multipartUpload.abort();
+        return new Response(JSON.stringify({ error: `Missing chunk ${i}` }), {
+          status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      const chunkBuffer = await chunkObj.arrayBuffer();
+      
+      // Upload this part
+      const partResult = await multipartUpload.uploadPart(i + 1, chunkBuffer);
+      partETags.push({
+        partNumber: i + 1,
+        etag: partResult.etag,
+      });
+    }
+
+    // Complete the multipart upload
+    await multipartUpload.complete(partETags);
+
+    // Clean up chunk files
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkKey = `${userId}/${fileId}/chunks/${i}`;
+      await env.R2_BUCKET.delete(chunkKey);
+    }
+
+    // Store in database
+    await env.DB.prepare(
+      'INSERT INTO files (id, user_id, name, size, mime_type, r2_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).bind(fileId, userId, fileName, fileSize, mimeType || 'application/octet-stream', r2Key, new Date().toISOString()).run();
+
+    return new Response(JSON.stringify({
+      id: fileId,
+      name: fileName,
+      size: fileSize,
+      owner: 'You',
+      shared: false
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Complete upload error:', error);
+    return new Response(JSON.stringify({ error: 'Failed to complete upload' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
 }
 
 async function handleUploadFile(
