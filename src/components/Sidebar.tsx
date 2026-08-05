@@ -113,10 +113,14 @@ export default function Sidebar({ isOpen, onUpload, storage }: SidebarProps) {
                 <span>{formatBytes(storage.used)}</span>
                 <span className="storage-limit">/ {formatBytes(storage.limit)}</span>
               </div>
+              <span>///</span>
+              <div className="storage-disclaimer storage-text">
+                I know it's not a lot, just testing out the app!
+              </div>
             </motion.div>
           )}
 
-          <motion.div className="sidebar-actions">
+          {/* <motion.div className="sidebar-actions">
             <motion.button 
               whileHover={{ scale: 1.02, paddingLeft: 12 }}
               whileTap={{ scale: 0.98 }}
@@ -124,7 +128,7 @@ export default function Sidebar({ isOpen, onUpload, storage }: SidebarProps) {
               <IconSettings size={20} />
               Settings
             </motion.button>
-          </motion.div>
+          </motion.div> */}
         </motion.aside>
       )}
     </AnimatePresence>
