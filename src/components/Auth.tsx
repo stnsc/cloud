@@ -21,12 +21,13 @@ export default function Auth({ onLogin }: AuthProps) {
     setLoading(true);
 
     try {
+      const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8787';
       const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
       const body = isLogin 
         ? { username, password }
         : { username, password, accessCode };
 
-      const response = await fetch(`http://localhost:8787${endpoint}`, {
+      const response = await fetch(`${apiUrl}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -43,7 +44,7 @@ export default function Auth({ onLogin }: AuthProps) {
       localStorage.setItem('username', data.username);
       onLogin(data.token, data.username);
     } catch (err) {
-      setError('Network error. Make sure the backend is running on port 8787.');
+      setError('Network error. Make sure the backend is running.');
       console.error(err);
     } finally {
       setLoading(false);
