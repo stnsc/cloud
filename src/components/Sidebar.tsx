@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import './Sidebar.css';
-import { IconUpload, IconSettings } from '@tabler/icons-react';
+import { IconUpload } from '@tabler/icons-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 interface SidebarProps {
