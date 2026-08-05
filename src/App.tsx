@@ -96,18 +96,8 @@ function App() {
     }
   };
 
-  const handleShare = async (id: string) => {
-    try {
-      setError(null);
-      await api.shareFile(id);
-      setFiles(files.map(f => 
-        f.id === id ? { ...f, shared: !f.shared } : f
-      ));
-    } catch (err) {
-      setError('Failed to share file');
-      console.error(err);
-    }
-  };
+  // Future: implement file sharing functionality
+  // const handleShare = async (id: string) => { ... }
 
   const handleDownload = async (id: string, name: string) => {
     try {
@@ -127,7 +117,7 @@ function App() {
     <div className="app">
       <Header onToggleSidebar={() => setSidebarOpen(!sidebarOpen)} onLogout={handleLogout} username={username} />
       <div className="app-main">
-        <Sidebar isOpen={sidebarOpen} onUpload={handleUpload} username={username} storage={storage} />
+        <Sidebar isOpen={sidebarOpen} onUpload={handleUpload} storage={storage} />
         <main className="main-content">
           {error && (
             <div style={{

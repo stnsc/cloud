@@ -6,11 +6,10 @@ import { motion, AnimatePresence } from 'framer-motion';
 interface SidebarProps {
   isOpen: boolean;
   onUpload: (file: File) => void;
-  username?: string;
   storage?: { used: number; limit: number; percentage: number };
 }
 
-export default function Sidebar({ isOpen, onUpload, username, storage }: SidebarProps) {
+export default function Sidebar({ isOpen, onUpload, storage }: SidebarProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
 
