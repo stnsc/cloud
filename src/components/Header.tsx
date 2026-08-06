@@ -26,7 +26,7 @@ export default function Header({ onToggleSidebar, onLogout, username }: HeaderPr
           animate={{ opacity: 1, x: 0 }}
           transition={{ duration: 0.3 }}
         >
-          Cloud Storage <span style={{ fontWeight: 'bold', fontStyle: 'italic', fontSize: '.5em', color: 'gray' }}>beta</span>
+          <img src="../src/assets/logo.png" alt="cloud." style={{width: '150px'}} /> <span style={{ fontWeight: 'bold', fontStyle: 'italic', fontSize: '.5em', color: 'gray' }}>beta</span>
         </motion.h1>
       </div>
       

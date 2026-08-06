@@ -14,6 +14,13 @@ database_id = "3b79e4d6-fdb9-43b7-9d89-5d84348b776d"
 [env.development]
 vars = { }
 
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+
 [build]
 command = "npm run build"
 cwd = "./"

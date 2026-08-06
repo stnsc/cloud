@@ -60,7 +60,8 @@ export default function Auth({ onLogin }: AuthProps) {
         transition={{ duration: 0.4 }}
       >
         <div className="auth-header">
-          <h1>Cloud Storage <span style={{ fontWeight: 'bold', fontStyle: 'italic', fontSize: '.5em', color: 'gray' }}>beta</span></h1>
+          <img src="../src/assets/logo.png" alt="cloud." style={{width: '300px'}}/>
+          <span style={{ fontWeight: 'bold', fontStyle: 'italic', fontSize: '2em', color: 'gray' }}>beta</span>
           <p>{isLogin ? 'Welcome back' : 'Registration'}</p>
         </div>
 
