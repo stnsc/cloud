@@ -7,6 +7,74 @@ function getAuthHeaders(): HeadersInit {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+interface PartResult {
+  partNumber: number;
+  etag: string;
+}
+
+// Uploads one part via XMLHttpRequest (for live upload.onprogress, which fetch()
+// doesn't expose), retrying with exponential backoff on network failure or a
+// non-2xx response. onBytesProgress reports bytes sent *for this part* on each
+// attempt, so the caller can track combined progress across concurrent parts.
+function uploadPartOnce(
+  url: string,
+  body: Blob,
+  token: string,
+  onBytesProgress: (loaded: number) => void
+): Promise<PartResult> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onBytesProgress(e.loaded);
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch {
+          reject(new Error('Malformed response from upload-chunk'));
+        }
+      } else {
+        reject(new Error(`Part upload failed with status ${xhr.status}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Network error during part upload'));
+    xhr.onabort = () => reject(new Error('Part upload aborted'));
+
+    xhr.send(body);
+  });
+}
+
+async function uploadPartWithRetry(
+  url: string,
+  body: Blob,
+  token: string,
+  onBytesProgress: (loaded: number) => void,
+  maxRetries = 4
+): Promise<PartResult> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await uploadPartOnce(url, body, token, onBytesProgress);
+    } catch (err) {
+      lastError = err;
+      // A failed/aborted attempt didn't actually land those bytes — reset this
+      // part's contribution to progress before retrying.
+      onBytesProgress(0);
+      if (attempt < maxRetries) {
+        const delay = Math.min(1000 * 2 ** attempt, 15000) + Math.random() * 500;
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Part upload failed');
+}
+
 export interface FileData {
   id: string;
   name: string;
@@ -101,9 +169,9 @@ export function useApi() {
   }, []);
 
   const uploadFile = useCallback(async (file: File, onProgress?: (percent: number) => void): Promise<FileData> => {
-    const CHUNK_SIZE = 80 * 1024 * 1024; // 80MB parts — safe now that parts stream straight into R2
+    const CHUNK_SIZE = 40 * 1024 * 1024; // 40MB parts — big enough to cut request count, small enough to avoid saturating upload bandwidth
     const MAX_FILE_SIZE = 25 * 1024 * 1024 * 1024;
-    const MAX_CONCURRENT_PARTS = 5; // parts in flight at once
+    const MAX_CONCURRENT_PARTS = 3; // parts in flight at once
 
     console.log('Uploading file:', file.name, file.size, file.type);
 
@@ -141,7 +209,8 @@ export function useApi() {
     }
 
     // For large files: R2 multipart upload, streamed directly (no FormData),
-    // with several parts uploaded concurrently instead of one at a time.
+    // with several parts uploaded concurrently, live per-byte progress, and
+    // automatic retry on a dropped/reset connection.
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     const token = localStorage.getItem('token') || '';
 
@@ -167,9 +236,15 @@ export function useApi() {
     const { fileId, r2Key, uploadId } = await urlResponse.json();
 
     // Step 2: Upload parts, several concurrently, each streamed as a raw body
-    const parts: { partNumber: number; etag: string }[] = new Array(totalChunks);
-    let completedChunks = 0;
+    const parts: PartResult[] = new Array(totalChunks);
+    const bytesPerPart = new Array(totalChunks).fill(0);
     let nextChunkIndex = 0;
+
+    const reportProgress = () => {
+      const totalLoaded = bytesPerPart.reduce((sum, b) => sum + b, 0);
+      const progress = Math.round((totalLoaded / file.size) * 90); // 90% for uploads
+      onProgress?.(progress);
+    };
 
     const uploadOnePart = async (chunkIndex: number) => {
       const start = chunkIndex * CHUNK_SIZE;
@@ -183,25 +258,17 @@ export function useApi() {
         partNumber: partNumber.toString(),
       });
 
-      const partResponse = await fetch(`${API_URL}/api/files/upload-chunk?${params.toString()}`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/octet-stream',
-        },
-        body: chunk, // raw bytes, streamed — no FormData wrapping
-      });
+      const result = await uploadPartWithRetry(
+        `${API_URL}/api/files/upload-chunk?${params.toString()}`,
+        chunk,
+        token,
+        (loaded) => {
+          bytesPerPart[chunkIndex] = loaded;
+          reportProgress();
+        }
+      );
 
-      if (!partResponse.ok) {
-        throw new Error(`Failed to upload part ${partNumber}/${totalChunks}`);
-      }
-
-      const { etag } = await partResponse.json();
-      parts[chunkIndex] = { partNumber, etag };
-
-      completedChunks += 1;
-      const progress = Math.round((completedChunks / totalChunks) * 90); // 90% for uploads
-      onProgress?.(progress);
+      parts[chunkIndex] = result;
     };
 
     // Simple worker-pool: each worker pulls the next chunk index until none remain.
