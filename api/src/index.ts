@@ -147,7 +147,7 @@ function getBearerToken(request: Request): string {
   return match?.[1].trim() || '';
 }
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10GB in bytes
+const MAX_FILE_SIZE = 25 * 1024 * 1024 * 1024; // 25GB in bytes
 const STORAGE_LIMIT = MAX_FILE_SIZE;
 
 function getR2ObjectKey(fileId: string): string {
@@ -528,10 +528,9 @@ async function handleUploadChunk(
     }
 
     const chunkKey = getR2ChunkKey(fileId, chunkIndex);
-    const buffer = await chunkData.arrayBuffer();
 
     // Upload chunk to R2
-    await env.R2_BUCKET.put(chunkKey, buffer);
+    await env.R2_BUCKET.put(chunkKey, chunkData);
 
     return new Response(JSON.stringify({
       fileId,

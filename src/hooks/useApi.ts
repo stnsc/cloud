@@ -101,13 +101,13 @@ export function useApi() {
   }, []);
 
   const uploadFile = useCallback(async (file: File, onProgress?: (percent: number) => void): Promise<FileData> => {
-    const CHUNK_SIZE = 80 * 1024 * 1024; // 80MB chunks
-    const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024;
+    const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB chunks to stay within Worker memory limits
+    const MAX_FILE_SIZE = 25 * 1024 * 1024 * 1024;
 
     console.log('Uploading file:', file.name, file.size, file.type);
 
     if (file.size > MAX_FILE_SIZE) {
-      throw new Error('Files larger than 10GB are not supported.');
+      throw new Error('Files larger than 25GB are not supported.');
     }
 
     // For small files, use direct upload
