@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 
 interface SidebarProps {
   isOpen: boolean;
-  onUpload: (file: File) => void;
+  onUpload: (files: File[]) => Promise<void>;
   storage?: { used: number; limit: number; percentage: number };
 }
 
@@ -24,10 +24,10 @@ export default function Sidebar({ isOpen, onUpload, storage }: SidebarProps) {
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     
-    const files = e.dataTransfer.files;
+    const files = Array.from(e.dataTransfer.files);
     if (files.length > 0) {
       setUploading(true);
-      await onUpload(files[0]);
+      await onUpload(files);
       setUploading(false);
     }
   };
@@ -36,7 +36,7 @@ export default function Sidebar({ isOpen, onUpload, storage }: SidebarProps) {
     const files = e.currentTarget.files;
     if (files && files.length > 0) {
       setUploading(true);
-      await onUpload(files[0]);
+      await onUpload(Array.from(files));
       setUploading(false);
       e.currentTarget.value = '';
     }
@@ -62,7 +62,8 @@ export default function Sidebar({ isOpen, onUpload, storage }: SidebarProps) {
         >
           <input 
             ref={fileInputRef}
-            type="file" 
+            type="file"
+            multiple
             onChange={handleFileSelect}
             style={{ display: 'none' }}
           />
@@ -88,7 +89,7 @@ export default function Sidebar({ isOpen, onUpload, storage }: SidebarProps) {
               whileTap={{ scale: 0.95 }}
               disabled={uploading}
             >
-              {uploading ? 'Uploading...' : 'Choose File'}
+              {uploading ? 'Uploading...' : 'Choose Files'}
             </motion.button>
           </motion.div>
 

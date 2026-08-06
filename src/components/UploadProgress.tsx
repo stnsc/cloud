@@ -4,9 +4,11 @@ import './UploadProgress.css';
 interface UploadProgressProps {
   fileName: string;
   progress: number;
+  fileIndex: number;
+  totalFiles: number;
 }
 
-export default function UploadProgress({ fileName, progress }: UploadProgressProps) {
+export default function UploadProgress({ fileName, progress, fileIndex, totalFiles }: UploadProgressProps) {
   return (
     <motion.div
       className="upload-progress-container"
@@ -16,7 +18,10 @@ export default function UploadProgress({ fileName, progress }: UploadProgressPro
     >
       <div className="upload-progress-content">
         <div className="upload-progress-info">
-          <div className="upload-progress-filename">{fileName}</div>
+          <div className="upload-progress-filename">
+            <span>{fileName}</span>
+            <span className="upload-progress-count">{fileIndex}/{totalFiles} files</span>
+          </div>
           <div className="upload-progress-percentage">{progress}%</div>
         </div>
         <div className="upload-progress-bar-container">

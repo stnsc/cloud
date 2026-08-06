@@ -33,7 +33,12 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [storage, setStorage] = useState({ used: 0, limit: 0, percentage: 0 });
-  const [uploadProgress, setUploadProgress] = useState<{ fileName: string; progress: number } | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{
+    fileName: string;
+    progress: number;
+    fileIndex: number;
+    totalFiles: number;
+  } | null>(null);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, DownloadProgressInfo>>({});
   const api = useApi();
 
@@ -126,26 +131,34 @@ function App() {
     localStorage.removeItem('username');
   };
 
-  const handleUpload = async (file: File) => {
-    try {
-      setError(null);
-      setUploadProgress({ fileName: file.name, progress: 0 });
-      const newFile = await api.uploadFile(file, (progress) => {
-        setUploadProgress({ fileName: file.name, progress });
-      });
-      if (currentFolder) {
-        await api.moveFile(newFile.id, currentFolder.id);
+  const handleUpload = async (uploadFiles: File[]) => {
+    setError(null);
+    const totalFiles = uploadFiles.length;
+    const uploadErrors: string[] = [];
+
+    for (let index = 0; index < uploadFiles.length; index++) {
+      const file = uploadFiles[index];
+      const fileIndex = index + 1;
+
+      try {
+        setUploadProgress({ fileName: file.name, progress: 0, fileIndex, totalFiles });
+        const newFile = await api.uploadFile(file, (progress) => {
+          setUploadProgress({ fileName: file.name, progress, fileIndex, totalFiles });
+        });
+        if (currentFolder) {
+          await api.moveFile(newFile.id, currentFolder.id);
+        }
+      } catch (err: any) {
+        uploadErrors.push(`${file.name}: ${err.message || 'Failed to upload file'}`);
+        console.error(err);
       }
-      await loadFiles(currentFolder?.id || null);
-      // Refresh storage info after upload
-      const storageInfo = await api.getStorage();
-      setStorage(storageInfo);
-      setUploadProgress(null);
-    } catch (err: any) {
-      setError(err.message || 'Failed to upload file');
-      console.error(err);
-      setUploadProgress(null);
     }
+
+    await loadFiles(currentFolder?.id || null);
+    if (uploadErrors.length > 0) {
+      setError(uploadErrors.join(' | '));
+    }
+    setUploadProgress(null);
   };
 
   const handleDelete = async (id: string) => {
@@ -199,7 +212,12 @@ function App() {
         <Sidebar isOpen={sidebarOpen} onUpload={handleUpload} storage={storage} />
         <main className="main-content">
           {uploadProgress && (
-            <UploadProgress fileName={uploadProgress.fileName} progress={uploadProgress.progress} />
+            <UploadProgress
+              fileName={uploadProgress.fileName}
+              progress={uploadProgress.progress}
+              fileIndex={uploadProgress.fileIndex}
+              totalFiles={uploadProgress.totalFiles}
+            />
           )}
           <FileExplorer 
             files={files} 
