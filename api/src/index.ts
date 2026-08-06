@@ -141,13 +141,40 @@ async function verifyJWT(token: string, secret: string): Promise<{ userId: strin
   }
 }
 
-const STORAGE_LIMIT = 1024 * 1024 * 1024; // 1GB in bytes
+function getBearerToken(request: Request): string {
+  const authorization = request.headers.get('Authorization')?.trim() || '';
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match?.[1].trim() || '';
+}
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10GB in bytes
+const STORAGE_LIMIT = MAX_FILE_SIZE;
+
+function getR2ObjectKey(fileId: string): string {
+  return `objects/${fileId}`;
+}
+
+function getR2ChunkKey(fileId: string, chunkIndex: number): string {
+  return `uploads/${fileId}/chunks/${chunkIndex}`;
+}
 
 async function getUserStorageUsage(env: Env, userId: string): Promise<number> {
   const result = await env.DB.prepare(
     'SELECT COALESCE(SUM(size), 0) as total FROM files WHERE user_id = ?'
   ).bind(userId).first() as any;
   return result?.total || 0;
+}
+
+async function hasDuplicateFile(
+  env: Env,
+  userId: string,
+  fileName: string,
+  fileSize: number
+): Promise<boolean> {
+  const result = await env.DB.prepare(
+    'SELECT 1 FROM files WHERE user_id = ? AND name = ? AND size = ? LIMIT 1'
+  ).bind(userId, fileName, fileSize).first();
+  return Boolean(result);
 }
 
 interface Env {
@@ -182,8 +209,7 @@ export default {
       }
 
       // All other endpoints require auth
-      const authHeader = request.headers.get('Authorization');
-      const token = authHeader?.replace('Bearer ', '') || '';
+      const token = getBearerToken(request);
       const user = await verifyJWT(token, env.JWT_SECRET);
 
       if (!user) {
@@ -194,7 +220,11 @@ export default {
       }
 
       if (path === '/api/files' && method === 'GET') {
-        return await handleListFiles(env, user.userId, corsHeaders);
+        return await handleListFiles(request, env, user.userId, corsHeaders);
+      } else if (path === '/api/folders' && method === 'GET') {
+        return await handleListFolders(request, env, user.userId, corsHeaders);
+      } else if (path === '/api/folders' && method === 'POST') {
+        return await handleCreateFolder(request, env, user.userId, corsHeaders);
       } else if (path === '/api/files/get-upload-url' && method === 'POST') {
         return await handleGetUploadUrl(request, env, user.userId, corsHeaders);
       } else if (path === '/api/files/upload-chunk' && method === 'POST') {
@@ -206,6 +236,9 @@ export default {
       } else if (path.match(/^\/api\/files\/[^/]+$/) && method === 'DELETE') {
         const fileId = path.split('/').pop();
         if (fileId) return await handleDeleteFile(env, user.userId, fileId, corsHeaders);
+      } else if (path.match(/^\/api\/files\/[^/]+\/move$/) && method === 'POST') {
+        const fileId = path.split('/')[3];
+        return await handleMoveFile(request, env, user.userId, fileId, corsHeaders);
       } else if (path.match(/^\/api\/files\/[^/]+\/download$/) && method === 'GET') {
         const fileId = path.split('/')[3];
         return await handleDownloadFile(env, user.userId, fileId, corsHeaders);
@@ -230,15 +263,34 @@ export default {
   },
 };
 
-async function handleListFiles(env: Env, userId: string, corsHeaders: any): Promise<Response> {
+async function handleListFiles(
+  request: Request,
+  env: Env,
+  userId: string,
+  corsHeaders: any
+): Promise<Response> {
+  const folderId = new URL(request.url).searchParams.get('folderId');
   const result = await env.DB.prepare(
-    'SELECT id, name, size, created_at FROM files WHERE user_id = ?'
-  ).bind(userId).all();
+    `SELECT f.id, f.name, f.size, f.mime_type, f.created_at
+     FROM files f
+     WHERE f.user_id = ?
+       AND (
+         (? IS NULL AND NOT EXISTS (
+           SELECT 1 FROM folder_files ff WHERE ff.file_id = f.id
+         ))
+         OR EXISTS (
+           SELECT 1 FROM folder_files ff
+           WHERE ff.file_id = f.id AND ff.folder_id = ?
+         )
+       )
+     ORDER BY f.created_at DESC`
+  ).bind(userId, folderId, folderId).all();
 
   const files = (result.results as any[]).map(f => ({
     id: f.id,
     name: f.name,
     size: f.size,
+    mimeType: f.mime_type,
     owner: 'You',
     shared: false,
     createdAt: f.created_at,
@@ -247,6 +299,137 @@ async function handleListFiles(env: Env, userId: string, corsHeaders: any): Prom
   return new Response(JSON.stringify(files), {
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   });
+}
+
+async function handleListFolders(
+  request: Request,
+  env: Env,
+  userId: string,
+  corsHeaders: any
+): Promise<Response> {
+  const parentFolderId = new URL(request.url).searchParams.get('parentId');
+  const result = await env.DB.prepare(
+    `SELECT id, name, parent_folder_id, created_at
+     FROM folders
+     WHERE user_id = ?
+       AND ((? IS NULL AND parent_folder_id IS NULL) OR parent_folder_id = ?)
+     ORDER BY name COLLATE NOCASE`
+  ).bind(userId, parentFolderId, parentFolderId).all();
+
+  return new Response(JSON.stringify((result.results as any[]).map(folder => ({
+    id: folder.id,
+    name: folder.name,
+    parentFolderId: folder.parent_folder_id,
+    createdAt: folder.created_at,
+  }))), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+async function handleCreateFolder(
+  request: Request,
+  env: Env,
+  userId: string,
+  corsHeaders: any
+): Promise<Response> {
+  try {
+    const body = await request.json() as { name?: string; parentFolderId?: string | null };
+    const name = body.name?.trim();
+    const parentFolderId = body.parentFolderId || null;
+
+    if (!name || name.length > 120) {
+      return new Response(JSON.stringify({ error: 'Folder name must be between 1 and 120 characters' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (parentFolderId) {
+      const parent = await env.DB.prepare(
+        'SELECT id FROM folders WHERE id = ? AND user_id = ?'
+      ).bind(parentFolderId, userId).first();
+      if (!parent) {
+        return new Response(JSON.stringify({ error: 'Parent folder not found' }), {
+          status: 404,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    const folderId = uuidv4();
+    const createdAt = new Date().toISOString();
+    await env.DB.prepare(
+      'INSERT INTO folders (id, user_id, name, parent_folder_id, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).bind(folderId, userId, name, parentFolderId, createdAt).run();
+
+    return new Response(JSON.stringify({
+      id: folderId,
+      name,
+      parentFolderId,
+      createdAt,
+    }), {
+      status: 201,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Create folder error:', error);
+    return new Response(JSON.stringify({ error: 'Failed to create folder' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+async function handleMoveFile(
+  request: Request,
+  env: Env,
+  userId: string,
+  fileId: string,
+  corsHeaders: any
+): Promise<Response> {
+  try {
+    const body = await request.json() as { folderId?: string | null };
+    const folderId = body.folderId || null;
+
+    const file = await env.DB.prepare(
+      'SELECT id FROM files WHERE id = ? AND user_id = ?'
+    ).bind(fileId, userId).first();
+    if (!file) {
+      return new Response(JSON.stringify({ error: 'File not found' }), {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (folderId) {
+      const folder = await env.DB.prepare(
+        'SELECT id FROM folders WHERE id = ? AND user_id = ?'
+      ).bind(folderId, userId).first();
+      if (!folder) {
+        return new Response(JSON.stringify({ error: 'Folder not found' }), {
+          status: 404,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    await env.DB.prepare('DELETE FROM folder_files WHERE file_id = ?').bind(fileId).run();
+    if (folderId) {
+      await env.DB.prepare(
+        'INSERT INTO folder_files (id, folder_id, file_id) VALUES (?, ?, ?)'
+      ).bind(uuidv4(), folderId, fileId).run();
+    }
+
+    return new Response(JSON.stringify({ success: true, folderId }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Move file error:', error);
+    return new Response(JSON.stringify({ error: 'Failed to move file' }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    });
+  }
 }
 
 async function handleGetUploadUrl(
@@ -262,6 +445,27 @@ async function handleGetUploadUrl(
     if (!fileName || !fileSize) {
       return new Response(JSON.stringify({ error: 'fileName and fileSize required' }), {
         status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (!Number.isSafeInteger(fileSize) || fileSize <= 0 || fileSize > MAX_FILE_SIZE) {
+      return new Response(JSON.stringify({
+        error: 'File too large',
+        limit: MAX_FILE_SIZE,
+        fileSize,
+      }), {
+        status: 413,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (await hasDuplicateFile(env, userId, fileName, fileSize)) {
+      return new Response(JSON.stringify({
+        error: 'Duplicate file',
+        message: `A file named "${fileName}" with the same size already exists.`,
+      }), {
+        status: 409,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
@@ -323,7 +527,7 @@ async function handleUploadChunk(
       });
     }
 
-    const chunkKey = `${userId}/${fileId}/chunks/${chunkIndex}`;
+    const chunkKey = getR2ChunkKey(fileId, chunkIndex);
     const buffer = await chunkData.arrayBuffer();
 
     // Upload chunk to R2
@@ -362,8 +566,43 @@ async function handleCompleteUpload(
       });
     }
 
+    if (!Number.isSafeInteger(fileSize) || fileSize <= 0 || fileSize > MAX_FILE_SIZE) {
+      return new Response(JSON.stringify({
+        error: 'File too large',
+        limit: MAX_FILE_SIZE,
+        fileSize,
+      }), {
+        status: 413,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (await hasDuplicateFile(env, userId, fileName, fileSize)) {
+      return new Response(JSON.stringify({
+        error: 'Duplicate file',
+        message: `A file named "${fileName}" with the same size already exists.`,
+      }), {
+        status: 409,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const currentUsage = await getUserStorageUsage(env, userId);
+    if (currentUsage + fileSize > STORAGE_LIMIT) {
+      return new Response(JSON.stringify({
+        error: 'Storage limit exceeded',
+        limit: STORAGE_LIMIT,
+        used: currentUsage,
+        fileSize,
+      }), {
+        status: 413,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
     // Use R2 multipart upload to avoid loading all chunks into memory
-    const r2Key = `${userId}/${fileId}/${fileName}`;
+    // Keep the original filename in D1 only; R2 receives an opaque key.
+    const r2Key = getR2ObjectKey(fileId);
     
     // Start multipart upload
     const multipartUpload = await env.R2_BUCKET.createMultipartUpload(r2Key, {
@@ -376,7 +615,7 @@ async function handleCompleteUpload(
 
     // Upload each chunk as a part
     for (let i = 0; i < totalChunks; i++) {
-      const chunkKey = `${userId}/${fileId}/chunks/${i}`;
+      const chunkKey = getR2ChunkKey(fileId, i);
       const chunkObj = await env.R2_BUCKET.get(chunkKey);
       
       if (!chunkObj) {
@@ -402,7 +641,7 @@ async function handleCompleteUpload(
 
     // Clean up chunk files
     for (let i = 0; i < totalChunks; i++) {
-      const chunkKey = `${userId}/${fileId}/chunks/${i}`;
+      const chunkKey = getR2ChunkKey(fileId, i);
       await env.R2_BUCKET.delete(chunkKey);
     }
 
@@ -449,9 +688,32 @@ async function handleUploadFile(
     // Handle File or Blob
     const file = fileEntry as unknown as { name: string; type: string; size: number; arrayBuffer: () => Promise<ArrayBuffer> };
     const fileId = uuidv4();
-    const buffer = await file.arrayBuffer();
     const fileName = file.name || 'file';
-    const r2Key = `${userId}/${fileId}/${fileName}`;
+
+    if (!Number.isSafeInteger(file.size) || file.size <= 0 || file.size > MAX_FILE_SIZE) {
+      return new Response(JSON.stringify({
+        error: 'File too large',
+        limit: MAX_FILE_SIZE,
+        fileSize: file.size,
+      }), {
+        status: 413,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    if (await hasDuplicateFile(env, userId, fileName, file.size)) {
+      return new Response(JSON.stringify({
+        error: 'Duplicate file',
+        message: `A file named "${fileName}" with the same size already exists.`,
+      }), {
+        status: 409,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const buffer = await file.arrayBuffer();
+    // Keep the original filename in D1 only; R2 receives an opaque key.
+    const r2Key = getR2ObjectKey(fileId);
 
     // Check storage limit
     const currentUsage = await getUserStorageUsage(env, userId);
@@ -573,6 +835,7 @@ async function handleDownloadFile(
       ...corsHeaders,
       'Content-Type': r2Object.httpMetadata?.contentType || 'application/octet-stream',
       'Content-Disposition': `attachment; filename="${file.name}"`,
+      'Content-Length': r2Object.size.toString(),
     },
   });
 }

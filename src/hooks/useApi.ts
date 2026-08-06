@@ -2,17 +2,32 @@ import { useCallback } from 'react';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8787';
 
+function getAuthHeaders(): HeadersInit {
+  const token = localStorage.getItem('token');
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export interface FileData {
   id: string;
   name: string;
   size: string;
+  mimeType?: string;
   owner: string;
   shared: boolean;
+  createdAt?: string;
+}
+
+export interface FolderData {
+  id: string;
+  name: string;
+  parentFolderId?: string | null;
+  createdAt?: string;
 }
 
 export function useApi() {
-  const listFiles = useCallback(async (): Promise<FileData[]> => {
-    const response = await fetch(`${API_URL}/api/files`, {
+  const listFiles = useCallback(async (folderId?: string | null): Promise<FileData[]> => {
+    const query = folderId ? `?folderId=${encodeURIComponent(folderId)}` : '';
+    const response = await fetch(`${API_URL}/api/files${query}`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${localStorage.getItem('token') || ''}`,
@@ -29,15 +44,71 @@ export function useApi() {
       id: f.id,
       name: f.name,
       size: formatFileSize(f.size),
+      mimeType: f.mimeType,
       owner: 'You',
       shared: false,
+      createdAt: f.createdAt,
     }));
   }, []);
 
+  const listFolders = useCallback(async (parentFolderId?: string | null): Promise<FolderData[]> => {
+    const query = parentFolderId ? `?parentId=${encodeURIComponent(parentFolderId)}` : '';
+    const response = await fetch(`${API_URL}/api/folders${query}`, {
+      method: 'GET',
+      headers: getAuthHeaders(),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || 'Failed to list folders');
+    }
+
+    return response.json();
+  }, []);
+
+  const createFolder = useCallback(async (name: string, parentFolderId?: string | null): Promise<FolderData> => {
+    const response = await fetch(`${API_URL}/api/folders`, {
+      method: 'POST',
+      headers: {
+        ...getAuthHeaders(),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name, parentFolderId: parentFolderId || null }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || 'Failed to create folder');
+    }
+
+    return response.json();
+  }, []);
+
+  const moveFile = useCallback(async (fileId: string, folderId: string | null): Promise<void> => {
+    const response = await fetch(`${API_URL}/api/files/${fileId}/move`, {
+      method: 'POST',
+      headers: {
+        ...getAuthHeaders(),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ folderId: folderId || null }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || 'Failed to move file');
+    }
+  }, []);
+
   const uploadFile = useCallback(async (file: File, onProgress?: (percent: number) => void): Promise<FileData> => {
-    const CHUNK_SIZE = 50 * 1024 * 1024; // 50MB chunks
+    const CHUNK_SIZE = 80 * 1024 * 1024; // 80MB chunks
+    const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024;
 
     console.log('Uploading file:', file.name, file.size, file.type);
+
+    if (file.size > MAX_FILE_SIZE) {
+      throw new Error('Files larger than 10GB are not supported.');
+    }
 
     // For small files, use direct upload
     if (file.size <= CHUNK_SIZE) {
@@ -186,7 +257,11 @@ export function useApi() {
     return data.shareUrl;
   }, []);
 
-  const downloadFile = useCallback(async (fileId: string, fileName: string): Promise<void> => {
+  const downloadFile = useCallback(async (
+    fileId: string,
+    fileName: string,
+    onProgress?: (loaded: number, total: number) => void
+  ): Promise<void> => {
     const response = await fetch(`${API_URL}/api/files/${fileId}/download`, {
       method: 'GET',
       headers: {
@@ -199,7 +274,32 @@ export function useApi() {
       throw new Error(error.error || 'Failed to download file');
     }
 
-    const blob = await response.blob();
+    const totalStr = response.headers.get('Content-Length');
+    const total = totalStr ? parseInt(totalStr, 10) : 0;
+
+    let blob: Blob;
+
+    if (response.body && total > 0 && onProgress) {
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let loaded = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          loaded += value.length;
+          onProgress(loaded, total);
+        }
+      }
+
+      blob = new Blob(chunks as BlobPart[]);
+    } else {
+      blob = await response.blob();
+      onProgress?.(blob.size, blob.size);
+    }
+
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -208,6 +308,21 @@ export function useApi() {
     a.click();
     window.URL.revokeObjectURL(url);
     document.body.removeChild(a);
+  }, []);
+
+  const getFilePreviewUrl = useCallback(async (fileId: string): Promise<string> => {
+    const response = await fetch(`${API_URL}/api/files/${fileId}/download`, {
+      method: 'GET',
+      headers: getAuthHeaders(),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || 'Failed to load file preview');
+    }
+
+    const blob = await response.blob();
+    return window.URL.createObjectURL(blob);
   }, []);
 
   const getStorage = useCallback(async () => {
@@ -227,10 +342,14 @@ export function useApi() {
 
   return {
     listFiles,
+    listFolders,
+    createFolder,
+    moveFile,
     uploadFile,
     deleteFile,
     shareFile,
     downloadFile,
+    getFilePreviewUrl,
     getStorage,
   };
 }

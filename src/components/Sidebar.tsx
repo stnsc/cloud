@@ -113,10 +113,6 @@ export default function Sidebar({ isOpen, onUpload, storage }: SidebarProps) {
                 <span>{formatBytes(storage.used)}</span>
                 <span className="storage-limit">/ {formatBytes(storage.limit)}</span>
               </div>
-              <span>///</span>
-              <div className="storage-disclaimer storage-text">
-                I know it's not a lot, just testing out the app!
-              </div>
             </motion.div>
           )}
 
