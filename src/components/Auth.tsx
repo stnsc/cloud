@@ -2,6 +2,7 @@ import './Auth.css';
 import { useState } from 'react';
 import { IconLock, IconUser } from '@tabler/icons-react';
 import { motion } from 'framer-motion';
+import logo from '../assets/logo.png';
 
 interface AuthProps {
   onLogin: (token: string, username: string) => void;
@@ -60,7 +61,7 @@ export default function Auth({ onLogin }: AuthProps) {
         transition={{ duration: 0.4 }}
       >
         <div className="auth-header">
-          <img src="../src/assets/logo.png" alt="cloud." style={{width: '300px'}}/>
+          <img src={logo} alt="cloud." style={{width: '300px'}}/>
           <span style={{ fontWeight: 'bold', fontStyle: 'italic', fontSize: '2em', color: 'gray' }}>beta</span>
           <p>{isLogin ? 'Welcome back' : 'Registration'}</p>
         </div>

@@ -1,6 +1,7 @@
 import './Header.css';
 import { IconMenu, IconLogout } from '@tabler/icons-react';
 import { motion } from 'framer-motion';
+import logo from '../assets/logo.png';
 
 interface HeaderProps {
   onToggleSidebar: () => void;
@@ -26,7 +27,7 @@ export default function Header({ onToggleSidebar, onLogout, username }: HeaderPr
           animate={{ opacity: 1, x: 0 }}
           transition={{ duration: 0.3 }}
         >
-          <img src="../src/assets/logo.png" alt="cloud." style={{width: '150px'}} /> <span style={{ fontWeight: 'bold', fontStyle: 'italic', fontSize: '.5em', color: 'gray' }}>beta</span>
+          <img src={logo} alt="cloud." style={{width: '150px'}} /> <span style={{ fontWeight: 'bold', fontStyle: 'italic', fontSize: '.5em', color: 'gray' }}>beta</span>
         </motion.h1>
       </div>
       
