@@ -101,8 +101,9 @@ export function useApi() {
   }, []);
 
   const uploadFile = useCallback(async (file: File, onProgress?: (percent: number) => void): Promise<FileData> => {
-    const CHUNK_SIZE = 20 * 1024 * 1024; // 20MB chunks to stay within Worker memory limits
+    const CHUNK_SIZE = 80 * 1024 * 1024; // 80MB parts — safe now that parts stream straight into R2
     const MAX_FILE_SIZE = 25 * 1024 * 1024 * 1024;
+    const MAX_CONCURRENT_PARTS = 5; // parts in flight at once
 
     console.log('Uploading file:', file.name, file.size, file.type);
 
@@ -139,14 +140,16 @@ export function useApi() {
       };
     }
 
-    // For large files, use chunked upload
+    // For large files: R2 multipart upload, streamed directly (no FormData),
+    // with several parts uploaded concurrently instead of one at a time.
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    
-    // Step 1: Get upload URL
+    const token = localStorage.getItem('token') || '';
+
+    // Step 1: Open the multipart upload session
     const urlResponse = await fetch(`${API_URL}/api/files/get-upload-url`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${localStorage.getItem('token') || ''}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -161,44 +164,64 @@ export function useApi() {
       throw new Error(error.error || 'Failed to prepare upload');
     }
 
-    const { fileId } = await urlResponse.json();
+    const { fileId, r2Key, uploadId } = await urlResponse.json();
 
-    // Step 2: Upload chunks
-    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    // Step 2: Upload parts, several concurrently, each streamed as a raw body
+    const parts: { partNumber: number; etag: string }[] = new Array(totalChunks);
+    let completedChunks = 0;
+    let nextChunkIndex = 0;
+
+    const uploadOnePart = async (chunkIndex: number) => {
       const start = chunkIndex * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, file.size);
       const chunk = file.slice(start, end);
+      const partNumber = chunkIndex + 1;
 
-      const chunkFormData = new FormData();
-      chunkFormData.append('fileId', fileId);
-      chunkFormData.append('chunkIndex', chunkIndex.toString());
-      chunkFormData.append('totalChunks', totalChunks.toString());
-      chunkFormData.append('fileName', file.name);
-      chunkFormData.append('mimeType', file.type);
-      chunkFormData.append('chunk', chunk);
-
-      const chunkResponse = await fetch(`${API_URL}/api/files/upload-chunk`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('token') || ''}`,
-        },
-        body: chunkFormData,
+      const params = new URLSearchParams({
+        key: r2Key,
+        uploadId,
+        partNumber: partNumber.toString(),
       });
 
-      if (!chunkResponse.ok) {
-        throw new Error(`Failed to upload chunk ${chunkIndex + 1}/${totalChunks}`);
+      const partResponse = await fetch(`${API_URL}/api/files/upload-chunk?${params.toString()}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        body: chunk, // raw bytes, streamed — no FormData wrapping
+      });
+
+      if (!partResponse.ok) {
+        throw new Error(`Failed to upload part ${partNumber}/${totalChunks}`);
       }
 
-      // Report progress
-      const progress = Math.round(((chunkIndex + 1) / totalChunks) * 90); // 90% for uploads
-      onProgress?.(progress);
-    }
+      const { etag } = await partResponse.json();
+      parts[chunkIndex] = { partNumber, etag };
 
-    // Step 3: Complete upload
+      completedChunks += 1;
+      const progress = Math.round((completedChunks / totalChunks) * 90); // 90% for uploads
+      onProgress?.(progress);
+    };
+
+    // Simple worker-pool: each worker pulls the next chunk index until none remain.
+    const worker = async () => {
+      while (nextChunkIndex < totalChunks) {
+        const chunkIndex = nextChunkIndex;
+        nextChunkIndex += 1;
+        await uploadOnePart(chunkIndex);
+      }
+    };
+
+    const workerCount = Math.min(MAX_CONCURRENT_PARTS, totalChunks);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    // Step 3: Complete the multipart upload — parts already live in R2,
+    // this just finalizes the object from the collected etags.
     const completeResponse = await fetch(`${API_URL}/api/files/complete-upload`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${localStorage.getItem('token') || ''}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -207,6 +230,9 @@ export function useApi() {
         totalChunks,
         mimeType: file.type,
         fileSize: file.size,
+        r2Key,
+        uploadId,
+        parts,
       }),
     });
 

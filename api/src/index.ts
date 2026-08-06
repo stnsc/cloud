@@ -154,10 +154,6 @@ function getR2ObjectKey(fileId: string): string {
   return `objects/${fileId}`;
 }
 
-function getR2ChunkKey(fileId: string, chunkIndex: number): string {
-  return `uploads/${fileId}/chunks/${chunkIndex}`;
-}
-
 async function getUserStorageUsage(env: Env, userId: string): Promise<number> {
   const result = await env.DB.prepare(
     'SELECT COALESCE(SUM(size), 0) as total FROM files WHERE user_id = ?'
@@ -228,7 +224,7 @@ export default {
       } else if (path === '/api/files/get-upload-url' && method === 'POST') {
         return await handleGetUploadUrl(request, env, user.userId, corsHeaders);
       } else if (path === '/api/files/upload-chunk' && method === 'POST') {
-        return await handleUploadChunk(request, env, user.userId, corsHeaders);
+        return await handleUploadPart(request, env, corsHeaders);
       } else if (path.match(/^\/api\/files\/complete-upload$/) && method === 'POST') {
         return await handleCompleteUpload(request, env, user.userId, corsHeaders);
       } else if (path === '/api/files/upload' && method === 'POST') {
@@ -484,14 +480,24 @@ async function handleGetUploadUrl(
       });
     }
 
-    // Generate a unique file ID and key
+    // Generate a unique file ID and key, then open a real R2 multipart upload session.
+    // Parts get streamed directly into this session (see handleUploadPart) instead of
+    // being stored as loose objects and reassembled later.
     const fileId = uuidv4();
+    const r2Key = getR2ObjectKey(fileId);
 
-    // Return fileId so frontend knows where to upload chunks
+    const multipartUpload = await env.R2_BUCKET.createMultipartUpload(r2Key, {
+      httpMetadata: {
+        contentType: mimeType || 'application/octet-stream',
+      },
+    });
+
     return new Response(JSON.stringify({
       fileId,
       fileName,
       fileSize,
+      r2Key,
+      uploadId: multipartUpload.uploadId,
       uploadEndpoint: '/api/files/upload-chunk'
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -505,43 +511,40 @@ async function handleGetUploadUrl(
   }
 }
 
-async function handleUploadChunk(
+async function handleUploadPart(
   request: Request,
   env: Env,
-  userId: string,
   corsHeaders: any
 ): Promise<Response> {
   try {
-    const formData = await request.formData();
-    const fileId = formData.get('fileId') as string;
-    const chunkIndex = parseInt(formData.get('chunkIndex') as string);
-    const totalChunks = parseInt(formData.get('totalChunks') as string);
-    const fileName = formData.get('fileName') as string;
-    const mimeType = formData.get('mimeType') as string;
-    const chunkData = formData.get('chunk') as unknown as Blob;
+    const url = new URL(request.url);
+    const r2Key = url.searchParams.get('key');
+    const uploadId = url.searchParams.get('uploadId');
+    const partNumber = parseInt(url.searchParams.get('partNumber') || '');
 
-    if (!fileId || isNaN(chunkIndex) || isNaN(totalChunks) || !chunkData) {
+    if (!r2Key || !uploadId || isNaN(partNumber) || !request.body) {
       return new Response(JSON.stringify({ error: 'Missing required fields' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    const chunkKey = getR2ChunkKey(fileId, chunkIndex);
-
-    // Upload chunk to R2
-    await env.R2_BUCKET.put(chunkKey, chunkData);
+    // Resume the multipart session (each request is a fresh, stateless Worker
+    // invocation) and stream the request body straight into R2 as a part.
+    // No FormData parsing and no full in-memory buffering of the chunk.
+    const multipartUpload = env.R2_BUCKET.resumeMultipartUpload(r2Key, uploadId);
+    const part = await multipartUpload.uploadPart(partNumber, request.body);
 
     return new Response(JSON.stringify({
-      fileId,
-      chunkIndex,
+      partNumber,
+      etag: part.etag,
       status: 'uploaded'
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (error) {
-    console.error('Upload chunk error:', error);
-    return new Response(JSON.stringify({ error: 'Failed to upload chunk' }), {
+    console.error('Upload part error:', error);
+    return new Response(JSON.stringify({ error: 'Failed to upload part', details: String(error) }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
@@ -556,9 +559,9 @@ async function handleCompleteUpload(
 ): Promise<Response> {
   try {
     const body = await request.json() as any;
-    const { fileId, fileName, totalChunks, mimeType, fileSize } = body;
+    const { fileId, fileName, totalChunks, mimeType, fileSize, r2Key: bodyR2Key, uploadId, parts } = body;
 
-    if (!fileId || !fileName || !totalChunks) {
+    if (!fileId || !fileName || !totalChunks || !uploadId || !Array.isArray(parts)) {
       return new Response(JSON.stringify({ error: 'Missing required fields' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -599,50 +602,15 @@ async function handleCompleteUpload(
       });
     }
 
-    // Use R2 multipart upload to avoid loading all chunks into memory
     // Keep the original filename in D1 only; R2 receives an opaque key.
-    const r2Key = getR2ObjectKey(fileId);
-    
-    // Start multipart upload
-    const multipartUpload = await env.R2_BUCKET.createMultipartUpload(r2Key, {
-      httpMetadata: {
-        contentType: mimeType || 'application/octet-stream',
-      },
-    });
+    const r2Key = bodyR2Key || getR2ObjectKey(fileId);
 
-    const partETags: { partNumber: number; etag: string }[] = [];
-
-    // Upload each chunk as a part
-    for (let i = 0; i < totalChunks; i++) {
-      const chunkKey = getR2ChunkKey(fileId, i);
-      const chunkObj = await env.R2_BUCKET.get(chunkKey);
-      
-      if (!chunkObj) {
-        await multipartUpload.abort();
-        return new Response(JSON.stringify({ error: `Missing chunk ${i}` }), {
-          status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-      }
-
-      const chunkBuffer = await chunkObj.arrayBuffer();
-      
-      // Upload this part
-      const partResult = await multipartUpload.uploadPart(i + 1, chunkBuffer);
-      partETags.push({
-        partNumber: i + 1,
-        etag: partResult.etag,
-      });
-    }
-
-    // Complete the multipart upload
-    await multipartUpload.complete(partETags);
-
-    // Clean up chunk files
-    for (let i = 0; i < totalChunks; i++) {
-      const chunkKey = getR2ChunkKey(fileId, i);
-      await env.R2_BUCKET.delete(chunkKey);
-    }
+    // Parts were already streamed straight into R2 by handleUploadPart, and the
+    // client collected each part's etag as it went — just finalize the session.
+    // partNumbers must be sorted ascending for R2's complete() call.
+    const sortedParts = [...parts].sort((a, b) => a.partNumber - b.partNumber);
+    const multipartUpload = env.R2_BUCKET.resumeMultipartUpload(r2Key, uploadId);
+    await multipartUpload.complete(sortedParts);
 
     // Store in database
     await env.DB.prepare(
